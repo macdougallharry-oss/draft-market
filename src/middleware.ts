@@ -4,6 +4,7 @@ import { NextResponse, type NextRequest } from "next/server";
 function isProtectedPath(pathname: string) {
   return (
     pathname.startsWith("/picks") ||
+    pathname.startsWith("/score") ||
     pathname.startsWith("/matchup") ||
     pathname.startsWith("/leaderboard") ||
     pathname.startsWith("/onboarding")
@@ -14,6 +15,7 @@ function isProtectedPath(pathname: string) {
 function requiresCompletedProfile(pathname: string) {
   return (
     pathname.startsWith("/picks") ||
+    pathname.startsWith("/score") ||
     pathname.startsWith("/matchup") ||
     pathname.startsWith("/leaderboard")
   );
