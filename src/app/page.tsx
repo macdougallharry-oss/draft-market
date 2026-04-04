@@ -1,12 +1,6 @@
 import Link from "next/link";
 import { SiteNav } from "@/components/site-nav";
-
-const stats = [
-  { label: "Players", value: "12.4k+" },
-  { label: "Leagues", value: "2.1k+" },
-  { label: "Coins", value: "450+" },
-  { label: "Free", value: "Forever" },
-] as const;
+import { createClient } from "@/lib/supabase/server";
 
 const steps = [
   {
@@ -26,7 +20,31 @@ const steps = [
   },
 ] as const;
 
-export default function Home() {
+async function fetchPlayerCount(): Promise<number> {
+  const supabase = await createClient();
+  const { data, error } = await supabase.rpc("public_profile_count");
+  if (error) {
+    console.error("[home] public_profile_count", error);
+    return 0;
+  }
+  if (typeof data === "number" && Number.isFinite(data)) return data;
+  if (typeof data === "string") {
+    const n = Number.parseInt(data, 10);
+    return Number.isFinite(n) ? n : 0;
+  }
+  return 0;
+}
+
+export default async function Home() {
+  const playerCount = await fetchPlayerCount();
+
+  const stats = [
+    { label: "Players", value: playerCount.toLocaleString("en-US") },
+    { label: "Weekly prize", value: "£50" },
+    { label: "Coins", value: "14+" },
+    { label: "Free", value: "Always" },
+  ] as const;
+
   return (
     <div className="min-h-screen bg-background text-foreground">
       <SiteNav />
