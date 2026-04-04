@@ -14,6 +14,9 @@ function SubmitSpinner({ className }: { className?: string }) {
   );
 }
 
+/** Browser timer id (avoids NodeJS.Timeout vs DOM number mismatch in client code). */
+type BrowserTimeoutId = ReturnType<typeof globalThis.setTimeout>;
+
 function LoginForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -26,14 +29,12 @@ function LoginForm() {
   const [signUpSuccess, setSignUpSuccess] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [welcomeRedirect, setWelcomeRedirect] = useState(false);
-  const postSignUpRedirectRef = useRef<ReturnType<typeof setTimeout> | null>(
-    null,
-  );
+  const postSignUpRedirectRef = useRef<BrowserTimeoutId | null>(null);
 
   useEffect(() => {
     return () => {
       if (postSignUpRedirectRef.current != null) {
-        clearTimeout(postSignUpRedirectRef.current);
+        globalThis.clearTimeout(postSignUpRedirectRef.current);
       }
     };
   }, []);
@@ -97,7 +98,7 @@ function LoginForm() {
     if (data.session) {
       setLoading(false);
       setWelcomeRedirect(true);
-      postSignUpRedirectRef.current = window.setTimeout(() => {
+      postSignUpRedirectRef.current = globalThis.setTimeout(() => {
         postSignUpRedirectRef.current = null;
         router.push("/onboarding");
         router.refresh();
