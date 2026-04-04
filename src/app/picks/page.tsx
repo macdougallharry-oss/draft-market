@@ -1,7 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { SiteNav } from "@/components/site-nav";
+import { createClient } from "@/lib/supabase/client";
+import { getISOWeekKey } from "@/lib/week";
 
 type Direction = "long" | "short";
 
@@ -12,7 +14,30 @@ type Coin = {
   change7d: number;
 };
 
-type Pick = Coin & { direction: Direction };
+type Pick = Coin & { direction: Direction; confidence: number };
+
+type PicksRow = {
+  id: string;
+  user_id: string;
+  week_number: number;
+  year: number;
+  coin_symbol: string;
+  coin_name: string;
+  direction: Direction;
+  confidence: number;
+  entry_price: number;
+  created_at: string;
+};
+
+type ActivePanel =
+  | {
+      symbol: string;
+      coin: Coin;
+      isNew: true;
+      direction: Direction;
+      confidence: number;
+    }
+  | { symbol: string; coin: Coin; isNew: false };
 
 type CoinGeckoMarket = {
   id: string;
@@ -26,7 +51,6 @@ type CoinGeckoMarket = {
 const COINGECKO_MARKETS_URL =
   "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=30&page=1&sparkline=false&price_change_percentage=7d";
 
-/** Display order = CoinGecko coin ids */
 const COIN_IDS_ORDER = [
   "bitcoin",
   "ethereum",
@@ -46,7 +70,9 @@ const COIN_IDS_ORDER = [
 ] as const;
 
 const MAX_PICKS = 5;
-const CONFIDENCE_PER_PICK = 20;
+const MIN_CONFIDENCE = 5;
+const MAX_CONFIDENCE_PER_PICK = 50;
+const MAX_TOTAL_CONFIDENCE = 100;
 
 const FALLBACK_COINS: Coin[] = [
   { symbol: "BTC", name: "Bitcoin", price: 98420, change7d: 4.12 },
@@ -104,10 +130,189 @@ function formatPrice(n: number) {
   return `$${n.toLocaleString("en-US", { minimumFractionDigits: 3, maximumFractionDigits: 4 })}`;
 }
 
+function normalizeSymbol(symbol: string) {
+  return symbol.trim().toUpperCase();
+}
+
+function clamp(n: number, lo: number, hi: number) {
+  return Math.max(lo, Math.min(hi, n));
+}
+
+function sumConfidence(list: Pick[]) {
+  return list.reduce((s, p) => s + p.confidence, 0);
+}
+
+/** Max points this symbol can use; others already count toward 100. */
+function maxConfidenceForPick(list: Pick[], symbol: string) {
+  const sym = normalizeSymbol(symbol);
+  const sumOthers = list
+    .filter((p) => normalizeSymbol(p.symbol) !== sym)
+    .reduce((s, p) => s + p.confidence, 0);
+  return Math.min(MAX_CONFIDENCE_PER_PICK, MAX_TOTAL_CONFIDENCE - sumOthers);
+}
+
+/** Room for a brand-new coin (not in list yet). */
+function maxConfidenceForNewPick(list: Pick[]) {
+  return Math.min(
+    MAX_CONFIDENCE_PER_PICK,
+    MAX_TOTAL_CONFIDENCE - sumConfidence(list),
+  );
+}
+
+function defaultConfidenceForNewPick(list: Pick[]) {
+  const cap = maxConfidenceForNewPick(list);
+  if (cap < MIN_CONFIDENCE) return MIN_CONFIDENCE;
+  return clamp(20, MIN_CONFIDENCE, cap);
+}
+
+/** One pick per symbol; first occurrence wins (stable order). */
+function dedupePicksBySymbol(list: Pick[]): Pick[] {
+  const m = new Map<string, Pick>();
+  for (const p of list) {
+    const sym = normalizeSymbol(p.symbol);
+    if (!m.has(sym)) {
+      m.set(sym, { ...p, symbol: sym });
+    }
+  }
+  return Array.from(m.values());
+}
+
+function formatLockedAt(iso: string) {
+  try {
+    return new Date(iso).toLocaleString(undefined, {
+      dateStyle: "medium",
+      timeStyle: "short",
+    });
+  } catch {
+    return iso;
+  }
+}
+
+function ConfidenceSlider({
+  value,
+  min,
+  max,
+  id,
+  onChange,
+  disabled,
+}: {
+  value: number;
+  min: number;
+  max: number;
+  id: string;
+  onChange: (v: number) => void;
+  disabled?: boolean;
+}) {
+  const safeMax = Math.max(min, max);
+  const shown = clamp(value, min, safeMax);
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between font-mono text-[11px] uppercase tracking-wider text-muted">
+        <label htmlFor={id}>Confidence</label>
+        <span className="tabular-nums text-accent">{shown} pts</span>
+      </div>
+      <input
+        id={id}
+        type="range"
+        min={min}
+        max={safeMax}
+        step={1}
+        value={shown}
+        disabled={disabled || safeMax < min}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className="h-2 w-full cursor-pointer appearance-none rounded-full bg-white/15 accent-[#00ff64] disabled:cursor-not-allowed disabled:opacity-40 [&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-[#00ff64] [&::-moz-range-thumb]:h-3.5 [&::-moz-range-thumb]:w-3.5 [&::-moz-range-thumb]:cursor-pointer [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-0 [&::-moz-range-thumb]:bg-[#00ff64]"
+      />
+      <p className="font-mono text-[10px] text-muted">
+        Range {min}–{safeMax} pts
+      </p>
+    </div>
+  );
+}
+
 export default function PicksPage() {
+  const [authLoading, setAuthLoading] = useState(true);
+  const [lockedRows, setLockedRows] = useState<PicksRow[]>([]);
+  const [picksLoading, setPicksLoading] = useState(true);
+
   const [picks, setPicks] = useState<Pick[]>([]);
   const [coins, setCoins] = useState<Coin[]>(FALLBACK_COINS);
   const [coinsLoading, setCoinsLoading] = useState(true);
+
+  const [activePanel, setActivePanel] = useState<ActivePanel | null>(null);
+  const activePanelRef = useRef<ActivePanel | null>(null);
+  activePanelRef.current = activePanel;
+
+  const [saveState, setSaveState] = useState<
+    "idle" | "saving" | "success" | "error"
+  >("idle");
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  const weekKey = useMemo(() => getISOWeekKey(), []);
+
+  const hasLockedThisWeek = lockedRows.length > 0;
+
+  const uniqueDraftPicks = useMemo(() => dedupePicksBySymbol(picks), [picks]);
+
+  const confidenceSum = useMemo(
+    () => sumConfidence(uniqueDraftPicks),
+    [uniqueDraftPicks],
+  );
+
+  const canAddAnotherPick =
+    uniqueDraftPicks.length < MAX_PICKS &&
+    MAX_TOTAL_CONFIDENCE - confidenceSum >= MIN_CONFIDENCE;
+
+  useEffect(() => {
+    let cancelled = false;
+    const supabase = createClient();
+
+    async function loadAuthAndPicks() {
+      setAuthLoading(true);
+      setPicksLoading(true);
+      const {
+        data: { user: u },
+      } = await supabase.auth.getUser();
+      if (cancelled) return;
+      setAuthLoading(false);
+
+      if (!u) {
+        setLockedRows([]);
+        setPicksLoading(false);
+        return;
+      }
+
+      const { weekNumber, year } = weekKey;
+      const { data, error } = await supabase
+        .from("picks")
+        .select(
+          "id, user_id, week_number, year, coin_symbol, coin_name, direction, confidence, entry_price, created_at",
+        )
+        .eq("user_id", u.id)
+        .eq("week_number", weekNumber)
+        .eq("year", year)
+        .order("created_at", { ascending: true });
+
+      if (cancelled) return;
+      if (error) {
+        console.error("picks fetch", error);
+        setLockedRows([]);
+      } else {
+        const rows = (data as PicksRow[]) ?? [];
+        const bySymbol = new Map<string, PicksRow>();
+        for (const r of rows) {
+          const sym = normalizeSymbol(r.coin_symbol);
+          if (!bySymbol.has(sym)) bySymbol.set(sym, { ...r, coin_symbol: sym });
+        }
+        setLockedRows(Array.from(bySymbol.values()));
+      }
+      setPicksLoading(false);
+    }
+
+    loadAuthAndPicks();
+    return () => {
+      cancelled = true;
+    };
+  }, [weekKey.weekNumber, weekKey.year]);
 
   useEffect(() => {
     let cancelled = false;
@@ -134,29 +339,185 @@ export default function PicksPage() {
     };
   }, []);
 
-  const confidence = Math.min(100, picks.length * CONFIDENCE_PER_PICK);
+  const lockedConfidence = lockedRows.reduce((s, r) => s + r.confidence, 0);
 
-  const addOrUpdatePick = useCallback(
+  const openPanel = useCallback(
     (coin: Coin, direction: Direction) => {
-      setPicks((prev) => {
-        const existing = prev.find((p) => p.symbol === coin.symbol);
-        if (existing) {
-          return prev.map((p) =>
-            p.symbol === coin.symbol ? { ...p, direction } : p,
-          );
-        }
-        if (prev.length >= MAX_PICKS) return prev;
-        return [...prev, { ...coin, direction }];
+      const sym = normalizeSymbol(coin.symbol);
+      const normalizedCoin: Coin = { ...coin, symbol: sym };
+      const existing = uniqueDraftPicks.find(
+        (p) => normalizeSymbol(p.symbol) === sym,
+      );
+
+      if (!existing) {
+        if (!canAddAnotherPick) return;
+        const cap = maxConfidenceForNewPick(uniqueDraftPicks);
+        if (cap < MIN_CONFIDENCE) return;
+        setActivePanel({
+          symbol: sym,
+          coin: normalizedCoin,
+          direction,
+          confidence: defaultConfidenceForNewPick(uniqueDraftPicks),
+          isNew: true,
+        });
+        return;
+      }
+
+      setActivePanel({
+        symbol: sym,
+        coin: normalizedCoin,
+        isNew: false,
       });
+      setPicks((prev) =>
+        dedupePicksBySymbol(prev).map((p) =>
+          normalizeSymbol(p.symbol) === sym ? { ...p, direction } : p,
+        ),
+      );
     },
-    [],
+    [canAddAnotherPick, uniqueDraftPicks],
   );
 
-  const removePick = useCallback((symbol: string) => {
-    setPicks((prev) => prev.filter((p) => p.symbol !== symbol));
+  const setPanelDirection = useCallback((direction: Direction) => {
+    let symToUpdate: string | null = null;
+    setActivePanel((ap) => {
+      if (!ap) return null;
+      if (ap.isNew) return { ...ap, direction };
+      symToUpdate = ap.symbol;
+      return ap;
+    });
+    if (symToUpdate !== null) {
+      setPicks((prev) =>
+        dedupePicksBySymbol(prev).map((p) =>
+          normalizeSymbol(p.symbol) === symToUpdate
+            ? { ...p, direction }
+            : p,
+        ),
+      );
+    }
   }, []);
 
-  const atMax = picks.length >= MAX_PICKS;
+  const setDraftPanelConfidence = useCallback((value: number) => {
+    setActivePanel((ap) => {
+      if (!ap || !ap.isNew) return ap;
+      const list = dedupePicksBySymbol(picks);
+      const maxV = maxConfidenceForNewPick(list);
+      const v = clamp(Math.round(value), MIN_CONFIDENCE, maxV);
+      return { ...ap, confidence: v };
+    });
+  }, [picks]);
+
+  const updatePickConfidence = useCallback((symbol: string, raw: number) => {
+    const sym = normalizeSymbol(symbol);
+    setPicks((prev) => {
+      const list = dedupePicksBySymbol(prev);
+      const maxV = maxConfidenceForPick(list, sym);
+      const v = clamp(Math.round(raw), MIN_CONFIDENCE, maxV);
+      return list.map((p) =>
+        normalizeSymbol(p.symbol) === sym ? { ...p, confidence: v } : p,
+      );
+    });
+  }, []);
+
+  const removePick = useCallback((symbol: string) => {
+    const sym = normalizeSymbol(symbol);
+    setPicks((prev) =>
+      prev.filter((p) => normalizeSymbol(p.symbol) !== sym),
+    );
+    setActivePanel((ap) =>
+      ap && normalizeSymbol(ap.symbol) === sym ? null : ap,
+    );
+  }, []);
+
+  const commitNewPick = useCallback(() => {
+    const ap = activePanelRef.current;
+    if (!ap || !ap.isNew) return;
+    setPicks((prev) => {
+      const list = dedupePicksBySymbol(prev);
+      const cap = maxConfidenceForNewPick(list);
+      const c = clamp(ap.confidence, MIN_CONFIDENCE, cap);
+      if (cap < MIN_CONFIDENCE) return prev;
+      return [
+        ...list,
+        {
+          ...ap.coin,
+          direction: ap.direction,
+          confidence: c,
+        },
+      ];
+    });
+    setActivePanel(null);
+  }, []);
+
+  const closePanel = useCallback(() => setActivePanel(null), []);
+
+  const picksValidForLock =
+    uniqueDraftPicks.length > 0 &&
+    uniqueDraftPicks.every((p) => {
+      const cap = maxConfidenceForPick(uniqueDraftPicks, p.symbol);
+      return (
+        p.confidence >= MIN_CONFIDENCE &&
+        p.confidence <= cap &&
+        p.confidence <= MAX_CONFIDENCE_PER_PICK
+      );
+    }) &&
+    confidenceSum <= MAX_TOTAL_CONFIDENCE;
+
+  const handleLockIn = useCallback(async () => {
+    const uniquePicks = dedupePicksBySymbol(picks);
+    if (uniquePicks.length !== picks.length) {
+      setPicks(uniquePicks);
+    }
+    if (uniquePicks.length === 0) return;
+    const sum = sumConfidence(uniquePicks);
+    if (sum > MAX_TOTAL_CONFIDENCE) return;
+
+    setSaveError(null);
+    setSaveState("saving");
+    const supabase = createClient();
+    const {
+      data: { user: u },
+    } = await supabase.auth.getUser();
+    if (!u) {
+      setSaveState("error");
+      setSaveError("You must be signed in to lock picks.");
+      return;
+    }
+
+    const { weekNumber, year } = weekKey;
+    const rows = uniquePicks.map((p) => ({
+      user_id: u.id,
+      week_number: weekNumber,
+      year,
+      coin_symbol: p.symbol,
+      coin_name: p.name,
+      direction: p.direction,
+      confidence: p.confidence,
+      entry_price: p.price,
+    }));
+
+    const { data, error } = await supabase
+      .from("picks")
+      .insert(rows)
+      .select(
+        "id, user_id, week_number, year, coin_symbol, coin_name, direction, confidence, entry_price, created_at",
+      );
+
+    if (error) {
+      console.error("picks insert", error);
+      setSaveState("error");
+      setSaveError(error.message);
+      return;
+    }
+
+    setLockedRows((data as PicksRow[]) ?? []);
+    setPicks([]);
+    setActivePanel(null);
+    setSaveState("success");
+  }, [picks, weekKey]);
+
+  const isExpanded = (coin: Coin) =>
+    activePanel &&
+    normalizeSymbol(activePanel.symbol) === normalizeSymbol(coin.symbol);
 
   return (
     <div className="min-h-screen bg-background text-foreground">
@@ -166,12 +527,25 @@ export default function PicksPage() {
         <section aria-label="Coin universe">
           <div className="mb-6">
             <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">
-              This week&apos;s board
+              {hasLockedThisWeek
+                ? "Your locked picks"
+                : "This week's board"}
             </h1>
             <p className="mt-1 font-mono text-xs uppercase tracking-wider text-muted">
-              Up to {MAX_PICKS} picks · tap long or short
+              {hasLockedThisWeek
+                ? `Week ${weekKey.weekNumber} · ${weekKey.year} · saved to your account`
+                : `Up to ${MAX_PICKS} picks · set confidence (5–50) · max ${MAX_TOTAL_CONFIDENCE} total`}
             </p>
-            {coinsLoading ? (
+            {saveState === "success" && (
+              <p
+                className="mt-3 rounded border border-accent/40 bg-accent/10 px-3 py-2 font-mono text-xs text-accent"
+                role="status"
+              >
+                Picks locked and saved for week {weekKey.weekNumber},{" "}
+                {weekKey.year}.
+              </p>
+            )}
+            {!hasLockedThisWeek && coinsLoading ? (
               <p
                 className="mt-3 font-mono text-xs text-accent"
                 aria-live="polite"
@@ -180,102 +554,261 @@ export default function PicksPage() {
                   Loading live prices from CoinGecko…
                 </span>
               </p>
-            ) : (
+            ) : !hasLockedThisWeek ? (
               <p className="mt-3 font-mono text-[11px] text-muted">
                 Prices via CoinGecko · USD · 7d change
               </p>
-            )}
+            ) : null}
           </div>
 
-          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-            {coinsLoading
-              ? COIN_IDS_ORDER.map((id) => (
-                  <div
-                    key={id}
-                    className="animate-pulse rounded-lg border border-[color:var(--border)] bg-white/[0.03] p-4"
-                    aria-hidden
-                  >
-                    <div className="h-5 w-16 rounded bg-white/10" />
-                    <div className="mt-2 h-4 w-28 rounded bg-white/5" />
-                    <div className="mt-6 h-8 w-32 rounded bg-white/10" />
-                    <div className="mt-2 h-4 w-24 rounded bg-white/5" />
-                    <div className="mt-4 flex gap-2">
-                      <div className="h-9 flex-1 rounded bg-white/5" />
-                      <div className="h-9 flex-1 rounded bg-white/5" />
+          {picksLoading && !hasLockedThisWeek ? (
+            <p className="font-mono text-sm text-muted">Loading your week…</p>
+          ) : hasLockedThisWeek ? (
+            <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+              {lockedRows.map((row) => (
+                <article
+                  key={row.id}
+                  className="rounded-lg border border-[color:var(--border)] bg-white/[0.02] p-4"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div>
+                      <p className="font-mono text-lg font-bold text-accent">
+                        {row.coin_symbol}
+                      </p>
+                      <p className="font-sans text-sm text-muted">
+                        {row.coin_name}
+                      </p>
                     </div>
-                  </div>
-                ))
-              : coins.map((coin) => {
-                  const selected = picks.find((p) => p.symbol === coin.symbol);
-                  const canAddNew = !selected && !atMax;
-                  const up = coin.change7d >= 0;
-
-                  return (
-                    <article
-                      key={coin.symbol}
-                      className={`rounded-lg border border-[color:var(--border)] bg-white/[0.02] p-4 transition-colors ${
-                        selected ? "ring-1 ring-accent/35" : ""
+                    <span
+                      className={`shrink-0 rounded px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-wide ${
+                        row.direction === "long"
+                          ? "bg-accent/15 text-accent"
+                          : "bg-accent-red/15 text-accent-red"
                       }`}
                     >
-                      <div className="flex items-start justify-between gap-2">
-                        <div>
-                          <p className="font-mono text-lg font-bold text-accent">
-                            {coin.symbol}
-                          </p>
-                          <p className="font-sans text-sm text-muted">
-                            {coin.name}
-                          </p>
-                        </div>
-                        {selected && (
-                          <span
-                            className={`shrink-0 rounded px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-wide ${
-                              selected.direction === "long"
-                                ? "bg-accent/15 text-accent"
-                                : "bg-accent-red/15 text-accent-red"
-                            }`}
-                          >
-                            {selected.direction}
-                          </span>
-                        )}
-                      </div>
-
-                      <div className="mt-4 space-y-1">
-                        <p className="font-mono text-xl font-bold tracking-tight">
-                          {formatPrice(coin.price)}
-                        </p>
-                        <p
-                          className={`font-mono text-sm font-medium ${
-                            up ? "text-accent" : "text-accent-red"
-                          }`}
-                        >
-                          {up ? "+" : ""}
-                          {coin.change7d.toFixed(2)}%{" "}
-                          <span className="text-muted">7d</span>
-                        </p>
-                      </div>
-
+                      {row.direction}
+                    </span>
+                  </div>
+                  <div className="mt-4 space-y-1">
+                    <p className="font-mono text-xs uppercase tracking-wider text-muted">
+                      Entry (locked)
+                    </p>
+                    <p className="font-mono text-xl font-bold tracking-tight">
+                      {formatPrice(Number(row.entry_price))}
+                    </p>
+                    <p className="font-mono text-sm text-muted">
+                      {row.confidence} confidence pts
+                    </p>
+                    <p className="font-mono text-[10px] text-muted/80">
+                      Locked {formatLockedAt(row.created_at)}
+                    </p>
+                  </div>
+                </article>
+              ))}
+            </div>
+          ) : (
+            <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+              {coinsLoading
+                ? COIN_IDS_ORDER.map((id) => (
+                    <div
+                      key={id}
+                      className="animate-pulse rounded-lg border border-[color:var(--border)] bg-white/[0.03] p-4"
+                      aria-hidden
+                    >
+                      <div className="h-5 w-16 rounded bg-white/10" />
+                      <div className="mt-2 h-4 w-28 rounded bg-white/5" />
+                      <div className="mt-6 h-8 w-32 rounded bg-white/10" />
+                      <div className="mt-2 h-4 w-24 rounded bg-white/5" />
                       <div className="mt-4 flex gap-2">
-                        <button
-                          type="button"
-                          disabled={!selected && !canAddNew}
-                          onClick={() => addOrUpdatePick(coin, "long")}
-                          className="flex-1 rounded border border-accent/50 bg-accent/10 py-2 font-mono text-xs font-bold uppercase tracking-wide text-accent transition hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-35"
-                        >
-                          Long
-                        </button>
-                        <button
-                          type="button"
-                          disabled={!selected && !canAddNew}
-                          onClick={() => addOrUpdatePick(coin, "short")}
-                          className="flex-1 rounded border border-accent-red/50 bg-accent-red/10 py-2 font-mono text-xs font-bold uppercase tracking-wide text-accent-red transition hover:bg-accent-red/20 disabled:cursor-not-allowed disabled:opacity-35"
-                        >
-                          Short
-                        </button>
+                        <div className="h-9 flex-1 rounded bg-white/5" />
+                        <div className="h-9 flex-1 rounded bg-white/5" />
                       </div>
-                    </article>
-                  );
-                })}
-          </div>
+                    </div>
+                  ))
+                : coins.map((coin) => {
+                    const selected = uniqueDraftPicks.find(
+                      (p) =>
+                        normalizeSymbol(p.symbol) ===
+                        normalizeSymbol(coin.symbol),
+                    );
+                    const expanded = isExpanded(coin);
+                    const canOpenNew = !selected && canAddAnotherPick;
+                    const up = coin.change7d >= 0;
+
+                    const panel = activePanel;
+                    const showPanel =
+                      expanded &&
+                      panel &&
+                      normalizeSymbol(panel.symbol) ===
+                        normalizeSymbol(coin.symbol);
+                    const maxForSlider = panel
+                      ? panel.isNew
+                        ? maxConfidenceForNewPick(uniqueDraftPicks)
+                        : maxConfidenceForPick(uniqueDraftPicks, coin.symbol)
+                      : MAX_CONFIDENCE_PER_PICK;
+
+                    const livePickForPanel =
+                      showPanel && panel && !panel.isNew ? selected : undefined;
+                    const panelDirection = panel?.isNew
+                      ? panel.direction
+                      : livePickForPanel?.direction ?? "long";
+                    const panelConfidence = panel?.isNew
+                      ? panel.confidence
+                      : livePickForPanel?.confidence ?? MIN_CONFIDENCE;
+
+                    return (
+                      <article
+                        key={coin.symbol}
+                        className={`rounded-lg border border-[color:var(--border)] bg-white/[0.02] p-4 transition-[padding,box-shadow] duration-200 ${
+                          expanded
+                            ? "ring-1 ring-accent/40 shadow-lg shadow-black/20 sm:col-span-2 xl:col-span-2"
+                            : selected
+                              ? "ring-1 ring-accent/25"
+                              : ""
+                        }`}
+                      >
+                        <button
+                          type="button"
+                          onClick={() =>
+                            selected
+                              ? openPanel(coin, selected.direction)
+                              : undefined
+                          }
+                          disabled={!selected}
+                          className={`w-full text-left ${selected ? "cursor-pointer" : "cursor-default"}`}
+                        >
+                          <div className="flex items-start justify-between gap-2">
+                            <div>
+                              <p className="font-mono text-lg font-bold text-accent">
+                                {coin.symbol}
+                              </p>
+                              <p className="font-sans text-sm text-muted">
+                                {coin.name}
+                              </p>
+                            </div>
+                            {selected && (
+                              <span
+                                className={`shrink-0 rounded px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-wide ${
+                                  selected.direction === "long"
+                                    ? "bg-accent/15 text-accent"
+                                    : "bg-accent-red/15 text-accent-red"
+                                }`}
+                              >
+                                {selected.direction} · {selected.confidence}pts
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="mt-4 space-y-1">
+                            <p className="font-mono text-xl font-bold tracking-tight">
+                              {formatPrice(coin.price)}
+                            </p>
+                            <p
+                              className={`font-mono text-sm font-medium ${
+                                up ? "text-accent" : "text-accent-red"
+                              }`}
+                            >
+                              {up ? "+" : ""}
+                              {coin.change7d.toFixed(2)}%{" "}
+                              <span className="text-muted">7d</span>
+                            </p>
+                          </div>
+                        </button>
+
+                        <div className="mt-4 flex gap-2">
+                          <button
+                            type="button"
+                            disabled={!selected && !canOpenNew}
+                            onClick={() => openPanel(coin, "long")}
+                            className="flex-1 rounded border border-accent/50 bg-accent/10 py-2 font-mono text-xs font-bold uppercase tracking-wide text-accent transition hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-35"
+                          >
+                            Long
+                          </button>
+                          <button
+                            type="button"
+                            disabled={!selected && !canOpenNew}
+                            onClick={() => openPanel(coin, "short")}
+                            className="flex-1 rounded border border-accent-red/50 bg-accent-red/10 py-2 font-mono text-xs font-bold uppercase tracking-wide text-accent-red transition hover:bg-accent-red/20 disabled:cursor-not-allowed disabled:opacity-35"
+                          >
+                            Short
+                          </button>
+                        </div>
+
+                        {showPanel && panel && (
+                          <div className="mt-4 border-t border-[color:var(--border)] pt-4">
+                            <p className="mb-3 font-mono text-[10px] uppercase tracking-widest text-muted">
+                              Set direction & confidence
+                            </p>
+                            <div className="flex gap-2">
+                              <button
+                                type="button"
+                                onClick={() => setPanelDirection("long")}
+                                className={`flex-1 rounded border py-2 font-mono text-xs font-bold uppercase tracking-wide transition ${
+                                  panelDirection === "long"
+                                    ? "border-accent bg-accent/20 text-accent"
+                                    : "border-white/10 text-muted hover:border-accent/40"
+                                }`}
+                              >
+                                Long
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setPanelDirection("short")}
+                                className={`flex-1 rounded border py-2 font-mono text-xs font-bold uppercase tracking-wide transition ${
+                                  panelDirection === "short"
+                                    ? "border-accent-red bg-accent-red/20 text-accent-red"
+                                    : "border-white/10 text-muted hover:border-accent-red/40"
+                                }`}
+                              >
+                                Short
+                              </button>
+                            </div>
+
+                            <div className="mt-4">
+                              <ConfidenceSlider
+                                id={`conf-${coin.symbol}`}
+                                value={panelConfidence}
+                                min={MIN_CONFIDENCE}
+                                max={Math.max(MIN_CONFIDENCE, maxForSlider)}
+                                onChange={(v) => {
+                                  if (panel.isNew) {
+                                    setDraftPanelConfidence(v);
+                                  } else {
+                                    updatePickConfidence(coin.symbol, v);
+                                  }
+                                }}
+                              />
+                            </div>
+
+                            <div className="mt-4 flex flex-wrap gap-2">
+                              {panel.isNew ? (
+                                <button
+                                  type="button"
+                                  onClick={commitNewPick}
+                                  disabled={
+                                    maxForSlider < MIN_CONFIDENCE ||
+                                    panel.confidence < MIN_CONFIDENCE
+                                  }
+                                  className="flex-1 rounded bg-accent py-2 font-mono text-xs font-bold uppercase tracking-wide text-background transition hover:brightness-110 disabled:opacity-40"
+                                >
+                                  Add to roster
+                                </button>
+                              ) : null}
+                              <button
+                                type="button"
+                                onClick={closePanel}
+                                className="rounded border border-white/15 px-4 py-2 font-mono text-xs uppercase tracking-wide text-muted transition hover:border-white/30 hover:text-foreground"
+                              >
+                                Done
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </article>
+                    );
+                  })}
+            </div>
+          )}
         </section>
 
         <aside
@@ -285,78 +818,181 @@ export default function PicksPage() {
           <div className="rounded-lg border border-[color:var(--border)] bg-black/30 p-5">
             <h2 className="font-sans text-lg font-semibold">Selected picks</h2>
             <p className="mt-1 font-mono text-[11px] uppercase tracking-wider text-muted">
-              {picks.length} / {MAX_PICKS} slots
+              {authLoading
+                ? "Checking session…"
+                : hasLockedThisWeek
+                  ? `${lockedRows.length} locked · Week ${weekKey.weekNumber}`
+                  : `${uniqueDraftPicks.length} / ${MAX_PICKS} picks · ${confidenceSum} / ${MAX_TOTAL_CONFIDENCE} pts`}
             </p>
 
-            <ul className="mt-4 min-h-[120px] space-y-2">
-              {picks.length === 0 ? (
-                <li className="rounded border border-dashed border-white/10 py-8 text-center font-mono text-xs text-muted">
-                  No picks yet — choose long or short on the grid.
+            {saveError && (
+              <p className="mt-3 rounded border border-accent-red/40 bg-accent-red/10 px-3 py-2 font-mono text-xs text-accent-red">
+                {saveError}
+              </p>
+            )}
+
+            <ul className="mt-4 min-h-[120px] space-y-3">
+              {authLoading || picksLoading ? (
+                <li className="py-6 text-center font-mono text-xs text-muted">
+                  Loading…
                 </li>
-              ) : (
-                picks.map((p) => (
+              ) : hasLockedThisWeek ? (
+                lockedRows.map((r) => (
                   <li
-                    key={p.symbol}
-                    className="flex items-center justify-between gap-2 rounded border border-[color:var(--border)] bg-white/[0.03] px-3 py-2"
+                    key={r.id}
+                    className="rounded border border-[color:var(--border)] bg-white/[0.03] px-3 py-2"
                   >
-                    <div className="min-w-0">
-                      <p className="font-mono text-sm font-bold text-foreground">
-                        {p.symbol}
-                      </p>
-                      <p className="truncate font-sans text-xs text-muted">
-                        {p.name}
-                      </p>
-                    </div>
-                    <div className="flex shrink-0 items-center gap-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <p className="font-mono text-sm font-bold text-foreground">
+                          {r.coin_symbol}
+                        </p>
+                        <p className="truncate font-sans text-xs text-muted">
+                          {r.coin_name} · {formatPrice(Number(r.entry_price))}
+                        </p>
+                      </div>
                       <span
-                        className={`font-mono text-[10px] font-bold uppercase ${
-                          p.direction === "long"
+                        className={`shrink-0 font-mono text-[10px] font-bold uppercase ${
+                          r.direction === "long"
                             ? "text-accent"
                             : "text-accent-red"
                         }`}
                       >
-                        {p.direction}
+                        {r.direction}
                       </span>
-                      <button
-                        type="button"
-                        onClick={() => removePick(p.symbol)}
-                        className="font-mono text-xs text-muted hover:text-foreground"
-                        aria-label={`Remove ${p.symbol}`}
-                      >
-                        ×
-                      </button>
                     </div>
+                    <p className="mt-2 font-mono text-[11px] text-muted">
+                      {r.confidence} pts
+                    </p>
                   </li>
                 ))
+              ) : uniqueDraftPicks.length === 0 ? (
+                <li className="rounded border border-dashed border-white/10 py-8 text-center font-mono text-xs text-muted">
+                  No picks yet — tap Long or Short on a coin, set confidence,
+                  then Add to roster.
+                </li>
+              ) : (
+                uniqueDraftPicks.map((p) => {
+                  const maxV = maxConfidenceForPick(uniqueDraftPicks, p.symbol);
+                  return (
+                    <li
+                      key={p.symbol}
+                      className="rounded border border-[color:var(--border)] bg-white/[0.03] px-3 py-3"
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          <p className="font-mono text-sm font-bold text-foreground">
+                            {p.symbol}
+                          </p>
+                          <p className="truncate font-sans text-xs text-muted">
+                            {p.name}
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => removePick(p.symbol)}
+                          className="shrink-0 font-mono text-xs text-muted hover:text-foreground"
+                          aria-label={`Remove ${p.symbol}`}
+                        >
+                          ×
+                        </button>
+                      </div>
+                      <div className="mt-2 flex gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setPicks((prev) =>
+                              dedupePicksBySymbol(prev).map((x) =>
+                                normalizeSymbol(x.symbol) ===
+                                normalizeSymbol(p.symbol)
+                                  ? { ...x, direction: "long" }
+                                  : x,
+                              ),
+                            );
+                          }}
+                          className={`flex-1 rounded border py-1.5 font-mono text-[10px] font-bold uppercase ${
+                            p.direction === "long"
+                              ? "border-accent bg-accent/15 text-accent"
+                              : "border-white/10 text-muted"
+                          }`}
+                        >
+                          Long
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setPicks((prev) =>
+                              dedupePicksBySymbol(prev).map((x) =>
+                                normalizeSymbol(x.symbol) ===
+                                normalizeSymbol(p.symbol)
+                                  ? { ...x, direction: "short" }
+                                  : x,
+                              ),
+                            );
+                          }}
+                          className={`flex-1 rounded border py-1.5 font-mono text-[10px] font-bold uppercase ${
+                            p.direction === "short"
+                              ? "border-accent-red bg-accent-red/15 text-accent-red"
+                              : "border-white/10 text-muted"
+                          }`}
+                        >
+                          Short
+                        </button>
+                      </div>
+                      <div className="mt-3">
+                        <ConfidenceSlider
+                          id={`side-${p.symbol}`}
+                          value={p.confidence}
+                          min={MIN_CONFIDENCE}
+                          max={Math.max(MIN_CONFIDENCE, maxV)}
+                          onChange={(v) => updatePickConfidence(p.symbol, v)}
+                        />
+                      </div>
+                    </li>
+                  );
+                })
               )}
             </ul>
 
             <div className="mt-6 border-t border-[color:var(--border)] pt-5">
               <div className="flex items-baseline justify-between gap-2">
                 <span className="font-mono text-[11px] uppercase tracking-wider text-muted">
-                  Confidence
+                  Total confidence
                 </span>
-                <span className="font-mono text-sm font-bold tabular-nums text-accent">
-                  {confidence} / 100
+                <span
+                  className={`font-mono text-sm font-bold tabular-nums ${
+                    confidenceSum > MAX_TOTAL_CONFIDENCE
+                      ? "text-accent-red"
+                      : "text-accent"
+                  }`}
+                >
+                  {hasLockedThisWeek ? lockedConfidence : confidenceSum} /{" "}
+                  {MAX_TOTAL_CONFIDENCE}
                 </span>
               </div>
               <div
                 className="mt-2 h-2 overflow-hidden rounded-full bg-white/10"
                 role="meter"
-                aria-valuenow={confidence}
+                aria-valuenow={
+                  hasLockedThisWeek ? lockedConfidence : confidenceSum
+                }
                 aria-valuemin={0}
-                aria-valuemax={100}
-                aria-label="Confidence points"
+                aria-valuemax={MAX_TOTAL_CONFIDENCE}
+                aria-label="Total confidence points"
               >
                 <div
                   className="h-full rounded-full bg-accent transition-[width] duration-300"
-                  style={{ width: `${confidence}%` }}
+                  style={{
+                    width: `${hasLockedThisWeek ? lockedConfidence : clamp((confidenceSum / MAX_TOTAL_CONFIDENCE) * 100, 0, 100)}%`,
+                  }}
                 />
               </div>
-              <p className="mt-2 font-mono text-[10px] leading-relaxed text-muted">
-                +{CONFIDENCE_PER_PICK} pts per pick · caps at 100 with a full
-                slate
-              </p>
+              {!hasLockedThisWeek && (
+                <p className="mt-2 font-mono text-[10px] leading-relaxed text-muted">
+                  Each pick: {MIN_CONFIDENCE}–{MAX_CONFIDENCE_PER_PICK} pts ·
+                  pool {MAX_TOTAL_CONFIDENCE} max
+                </p>
+              )}
             </div>
 
             <p className="mt-5 rounded border border-accent/20 bg-accent/5 px-3 py-2 font-mono text-xs text-accent">
@@ -364,13 +1000,24 @@ export default function PicksPage() {
               <span className="font-bold">£50</span> prize.
             </p>
 
-            <button
-              type="button"
-              disabled={picks.length === 0}
-              className="mt-5 w-full rounded py-3 font-mono text-sm font-bold uppercase tracking-wide transition enabled:bg-accent enabled:text-background enabled:hover:brightness-110 disabled:cursor-not-allowed disabled:border disabled:border-white/10 disabled:bg-white/5 disabled:text-muted"
-            >
-              Lock in picks
-            </button>
+            {hasLockedThisWeek ? (
+              <p className="mt-5 text-center font-mono text-[11px] uppercase tracking-wider text-muted">
+                Picks are locked for this week
+              </p>
+            ) : (
+              <button
+                type="button"
+                disabled={
+                  uniqueDraftPicks.length === 0 ||
+                  saveState === "saving" ||
+                  !picksValidForLock
+                }
+                onClick={handleLockIn}
+                className="mt-5 w-full rounded py-3 font-mono text-sm font-bold uppercase tracking-wide transition enabled:bg-accent enabled:text-background enabled:hover:brightness-110 disabled:cursor-not-allowed disabled:border disabled:border-white/10 disabled:bg-white/5 disabled:text-muted"
+              >
+                {saveState === "saving" ? "Saving…" : "Lock in picks"}
+              </button>
+            )}
           </div>
         </aside>
       </div>
