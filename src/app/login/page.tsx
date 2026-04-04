@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { Suspense, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 
@@ -25,6 +25,18 @@ function LoginForm() {
   const [error, setError] = useState<string | null>(null);
   const [signUpSuccess, setSignUpSuccess] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [welcomeRedirect, setWelcomeRedirect] = useState(false);
+  const postSignUpRedirectRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+
+  useEffect(() => {
+    return () => {
+      if (postSignUpRedirectRef.current != null) {
+        clearTimeout(postSignUpRedirectRef.current);
+      }
+    };
+  }, []);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -50,7 +62,6 @@ function LoginForm() {
     }
 
     const origin = window.location.origin;
-    console.log('Supabase URL:', process.env.NEXT_PUBLIC_SUPABASE_URL);
 
     let data: Awaited<
       ReturnType<typeof supabase.auth.signUp>
@@ -84,8 +95,13 @@ function LoginForm() {
     }
 
     if (data.session) {
-      router.push("/picks");
-      router.refresh();
+      setLoading(false);
+      setWelcomeRedirect(true);
+      postSignUpRedirectRef.current = window.setTimeout(() => {
+        postSignUpRedirectRef.current = null;
+        router.push("/onboarding");
+        router.refresh();
+      }, 1800);
       return;
     }
 
@@ -111,6 +127,31 @@ function LoginForm() {
 
       <main className="flex flex-1 flex-col justify-center px-6 py-12">
         <div className="mx-auto w-full max-w-md">
+          {welcomeRedirect ? (
+            <div
+              className="rounded-lg border border-[rgba(0,255,100,0.2)] bg-[rgba(0,255,100,0.06)] px-6 py-10 text-center"
+              role="status"
+              aria-live="polite"
+              aria-busy="true"
+            >
+              <p className="font-mono text-xs uppercase tracking-[0.2em] text-[#00ff64]">
+                You&apos;re in
+              </p>
+              <h2 className="mt-4 font-sans text-2xl font-semibold leading-snug tracking-tight sm:text-3xl">
+                Welcome to DraftMarket!
+              </h2>
+              <p className="mt-3 font-sans text-sm leading-relaxed text-[#6b7f72]">
+                Setting up your account…
+              </p>
+              <div className="mt-8 flex justify-center">
+                <span
+                  className="inline-block size-6 rounded-full border-2 border-[#00ff64]/25 border-t-[#00ff64] animate-spin"
+                  aria-hidden
+                />
+              </div>
+            </div>
+          ) : (
+            <>
           <p className="font-mono text-xs uppercase tracking-[0.2em] text-[#00ff64]">
             Account
           </p>
@@ -253,6 +294,8 @@ function LoginForm() {
               ← Back to home
             </Link>
           </p>
+            </>
+          )}
         </div>
       </main>
     </div>
