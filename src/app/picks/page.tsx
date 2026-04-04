@@ -3,7 +3,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { SiteNav } from "@/components/site-nav";
 import { createClient } from "@/lib/supabase/client";
-import { getISOWeekKey } from "@/lib/week";
+import {
+  formatDurationParts,
+  getISOWeekKey,
+  getMondayUTCOfDate,
+  getNextPickWindowOpenUTC,
+  getPickDeadline,
+  isPickWindowOpen,
+} from "@/lib/week";
 
 type Direction = "long" | "short";
 
@@ -272,6 +279,18 @@ function formatLockedAt(iso: string) {
   }
 }
 
+/** “Picks lock in …” / reopen countdown: prefer days+hours, then hours+minutes. */
+function pickWindowCountdownLabel(ms: number) {
+  const { days, hours, minutes } = formatDurationParts(ms);
+  if (days > 0) {
+    return `${days} day${days === 1 ? "" : "s"} ${hours} hour${hours === 1 ? "" : "s"}`;
+  }
+  if (hours > 0) {
+    return `${hours} hour${hours === 1 ? "" : "s"} ${minutes} minute${minutes === 1 ? "" : "s"}`;
+  }
+  return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+}
+
 function ConfidenceSlider({
   value,
   min,
@@ -332,9 +351,39 @@ export default function PicksPage() {
   >("idle");
   const [saveError, setSaveError] = useState<string | null>(null);
 
-  const weekKey = useMemo(() => getISOWeekKey(), []);
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNowTick(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const nowDate = useMemo(() => new Date(nowTick), [nowTick]);
+  const pickWindowOpen = useMemo(
+    () => isPickWindowOpen(nowDate),
+    [nowDate],
+  );
+  /** Stable for the whole Mon–Sun UTC week so picks fetch does not run every tick. */
+  const weekStableKey = useMemo(
+    () => getMondayUTCOfDate(new Date(nowTick)).getTime(),
+    [nowTick],
+  );
+  const weekKey = useMemo(
+    () => getISOWeekKey(new Date(weekStableKey)),
+    [weekStableKey],
+  );
+
+  const reopenInMs = useMemo(
+    () => getNextPickWindowOpenUTC(nowDate).getTime() - nowTick,
+    [nowDate, nowTick],
+  );
+  const lockInMs = useMemo(
+    () => getPickDeadline(nowDate).getTime() - nowTick,
+    [nowDate, nowTick],
+  );
 
   const hasLockedThisWeek = lockedRows.length > 0;
+  const showLockedNoPicks =
+    !pickWindowOpen && !hasLockedThisWeek && !picksLoading;
 
   const uniqueDraftPicks = useMemo(() => dedupePicksBySymbol(picks), [picks]);
 
@@ -402,9 +451,16 @@ export default function PicksPage() {
     return () => {
       cancelled = true;
     };
-  }, [weekKey.weekNumber, weekKey.year]);
+  }, [weekKey]);
 
   useEffect(() => {
+    if (!pickWindowOpen && !hasLockedThisWeek) {
+      setCoins(boardSlotsWithoutPrices());
+      setCoinsLoading(false);
+      setCoinsError(null);
+      return;
+    }
+
     let cancelled = false;
     let networkBusy = false;
 
@@ -487,7 +543,7 @@ export default function PicksPage() {
       cancelled = true;
       window.clearInterval(intervalId);
     };
-  }, []);
+  }, [pickWindowOpen, hasLockedThisWeek]);
 
   const lockedConfidence = lockedRows.reduce((s, r) => s + r.confidence, 0);
 
@@ -615,6 +671,11 @@ export default function PicksPage() {
     confidenceSum <= MAX_TOTAL_CONFIDENCE;
 
   const handleLockIn = useCallback(async () => {
+    if (!isPickWindowOpen()) {
+      setSaveState("error");
+      setSaveError("The pick window is closed. Picks reopen Monday 00:00 UTC.");
+      return;
+    }
     const uniquePicks = dedupePicksBySymbol(picks);
     if (uniquePicks.length !== picks.length) {
       setPicks(uniquePicks);
@@ -708,13 +769,34 @@ export default function PicksPage() {
             <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">
               {hasLockedThisWeek
                 ? "Your locked picks"
-                : "This week's board"}
+                : showLockedNoPicks
+                  ? "Picks are locked"
+                  : "This week's board"}
             </h1>
             <p className="mt-1 font-mono text-xs uppercase tracking-wider text-muted">
               {hasLockedThisWeek
                 ? `Week ${weekKey.weekNumber} · ${weekKey.year} · saved to your account`
-                : `Up to ${MAX_PICKS} picks · set confidence (5–50) · max ${MAX_TOTAL_CONFIDENCE} total`}
+                : showLockedNoPicks
+                  ? "Entries open Mon 00:00 UTC through Tue 23:59 UTC each week"
+                  : `Up to ${MAX_PICKS} picks · set confidence (5–50) · max ${MAX_TOTAL_CONFIDENCE} total`}
             </p>
+            {pickWindowOpen && !hasLockedThisWeek && (
+              <p
+                className="mt-2 font-mono text-[11px] tabular-nums text-accent"
+                aria-live="polite"
+              >
+                Picks lock in {pickWindowCountdownLabel(lockInMs)}
+              </p>
+            )}
+            {showLockedNoPicks && (
+              <p
+                className="mt-2 font-mono text-[11px] tabular-nums text-muted"
+                aria-live="polite"
+              >
+                Picks reopen in {pickWindowCountdownLabel(reopenInMs)} · next
+                window starts Monday 00:00 UTC
+              </p>
+            )}
             {saveState === "success" && (
               <p
                 className="mt-3 rounded border border-accent/40 bg-accent/10 px-3 py-2 font-mono text-xs text-accent"
@@ -724,7 +806,7 @@ export default function PicksPage() {
                 {weekKey.year}.
               </p>
             )}
-            {!hasLockedThisWeek && coinsLoading ? (
+            {pickWindowOpen && !hasLockedThisWeek && coinsLoading ? (
               <p
                 className="mt-3 font-mono text-xs text-accent"
                 aria-live="polite"
@@ -733,12 +815,12 @@ export default function PicksPage() {
                   Loading live prices from CoinGecko…
                 </span>
               </p>
-            ) : !hasLockedThisWeek ? (
+            ) : pickWindowOpen && !hasLockedThisWeek ? (
               <p className="mt-3 font-mono text-[11px] text-muted">
                 Prices via CoinGecko · USD · 7d change
               </p>
             ) : null}
-            {coinsError && !hasLockedThisWeek ? (
+            {coinsError && pickWindowOpen && !hasLockedThisWeek ? (
               <p
                 className="mt-3 rounded border border-accent-red/40 bg-accent-red/10 px-3 py-2 font-mono text-xs text-accent-red"
                 role="alert"
@@ -792,6 +874,23 @@ export default function PicksPage() {
                   </div>
                 </article>
               ))}
+            </div>
+          ) : showLockedNoPicks ? (
+            <div
+              className="rounded-lg border border-[color:var(--border)] bg-white/[0.02] px-6 py-16 text-center"
+              role="status"
+              aria-label="Picks locked until next window"
+            >
+              <p className="font-mono text-sm uppercase tracking-wider text-muted">
+                Picks are locked
+              </p>
+              <p className="mt-5 font-mono text-3xl font-bold tabular-nums tracking-tight text-accent sm:text-4xl">
+                {pickWindowCountdownLabel(reopenInMs)}
+              </p>
+              <p className="mt-3 max-w-md mx-auto font-mono text-xs leading-relaxed text-muted">
+                The board opens again Monday 00:00 UTC. You can lock entries
+                through Tuesday 23:59 UTC.
+              </p>
             </div>
           ) : (
             <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
@@ -1041,13 +1140,17 @@ export default function PicksPage() {
           aria-label="Your picks"
         >
           <div className="rounded-lg border border-[color:var(--border)] bg-black/30 p-5">
-            <h2 className="font-sans text-lg font-semibold">Selected picks</h2>
+            <h2 className="font-sans text-lg font-semibold">
+              {showLockedNoPicks ? "Picks are locked" : "Selected picks"}
+            </h2>
             <p className="mt-1 font-mono text-[11px] uppercase tracking-wider text-muted">
               {authLoading
                 ? "Checking session…"
-                : hasLockedThisWeek
-                  ? `${lockedRows.length} locked · Week ${weekKey.weekNumber}`
-                  : `${uniqueDraftPicks.length} / ${MAX_PICKS} picks · ${confidenceSum} / ${MAX_TOTAL_CONFIDENCE} pts`}
+                : showLockedNoPicks
+                  ? `Reopens in ${pickWindowCountdownLabel(reopenInMs)} · Mon 00:00 UTC`
+                  : hasLockedThisWeek
+                    ? `${lockedRows.length} locked · Week ${weekKey.weekNumber}`
+                    : `${uniqueDraftPicks.length} / ${MAX_PICKS} picks · ${confidenceSum} / ${MAX_TOTAL_CONFIDENCE} pts`}
             </p>
 
             {saveError && (
@@ -1091,6 +1194,11 @@ export default function PicksPage() {
                     </p>
                   </li>
                 ))
+              ) : showLockedNoPicks ? (
+                <li className="rounded border border-dashed border-white/10 py-8 text-center font-mono text-xs text-muted">
+                  Entry window is closed. You can build a roster when the board
+                  opens Monday 00:00 UTC.
+                </li>
               ) : uniqueDraftPicks.length === 0 ? (
                 <li className="rounded border border-dashed border-white/10 py-8 text-center font-mono text-xs text-muted">
                   No picks yet — tap Long or Short on a coin, set confidence,
@@ -1179,46 +1287,48 @@ export default function PicksPage() {
               )}
             </ul>
 
-            <div className="mt-6 border-t border-[color:var(--border)] pt-5">
-              <div className="flex items-baseline justify-between gap-2">
-                <span className="font-mono text-[11px] uppercase tracking-wider text-muted">
-                  Total confidence
-                </span>
-                <span
-                  className={`font-mono text-sm font-bold tabular-nums ${
-                    confidenceSum > MAX_TOTAL_CONFIDENCE
-                      ? "text-accent-red"
-                      : "text-accent"
-                  }`}
-                >
-                  {hasLockedThisWeek ? lockedConfidence : confidenceSum} /{" "}
-                  {MAX_TOTAL_CONFIDENCE}
-                </span>
-              </div>
-              <div
-                className="mt-2 h-2 overflow-hidden rounded-full bg-white/10"
-                role="meter"
-                aria-valuenow={
-                  hasLockedThisWeek ? lockedConfidence : confidenceSum
-                }
-                aria-valuemin={0}
-                aria-valuemax={MAX_TOTAL_CONFIDENCE}
-                aria-label="Total confidence points"
-              >
+            {!showLockedNoPicks && (
+              <div className="mt-6 border-t border-[color:var(--border)] pt-5">
+                <div className="flex items-baseline justify-between gap-2">
+                  <span className="font-mono text-[11px] uppercase tracking-wider text-muted">
+                    Total confidence
+                  </span>
+                  <span
+                    className={`font-mono text-sm font-bold tabular-nums ${
+                      confidenceSum > MAX_TOTAL_CONFIDENCE
+                        ? "text-accent-red"
+                        : "text-accent"
+                    }`}
+                  >
+                    {hasLockedThisWeek ? lockedConfidence : confidenceSum} /{" "}
+                    {MAX_TOTAL_CONFIDENCE}
+                  </span>
+                </div>
                 <div
-                  className="h-full rounded-full bg-accent transition-[width] duration-300"
-                  style={{
-                    width: `${hasLockedThisWeek ? lockedConfidence : clamp((confidenceSum / MAX_TOTAL_CONFIDENCE) * 100, 0, 100)}%`,
-                  }}
-                />
+                  className="mt-2 h-2 overflow-hidden rounded-full bg-white/10"
+                  role="meter"
+                  aria-valuenow={
+                    hasLockedThisWeek ? lockedConfidence : confidenceSum
+                  }
+                  aria-valuemin={0}
+                  aria-valuemax={MAX_TOTAL_CONFIDENCE}
+                  aria-label="Total confidence points"
+                >
+                  <div
+                    className="h-full rounded-full bg-accent transition-[width] duration-300"
+                    style={{
+                      width: `${hasLockedThisWeek ? lockedConfidence : clamp((confidenceSum / MAX_TOTAL_CONFIDENCE) * 100, 0, 100)}%`,
+                    }}
+                  />
+                </div>
+                {!hasLockedThisWeek && (
+                  <p className="mt-2 font-mono text-[10px] leading-relaxed text-muted">
+                    Each pick: {MIN_CONFIDENCE}–{MAX_CONFIDENCE_PER_PICK} pts ·
+                    pool {MAX_TOTAL_CONFIDENCE} max
+                  </p>
+                )}
               </div>
-              {!hasLockedThisWeek && (
-                <p className="mt-2 font-mono text-[10px] leading-relaxed text-muted">
-                  Each pick: {MIN_CONFIDENCE}–{MAX_CONFIDENCE_PER_PICK} pts ·
-                  pool {MAX_TOTAL_CONFIDENCE} max
-                </p>
-              )}
-            </div>
+            )}
 
             <p className="mt-5 rounded border border-accent/20 bg-accent/5 px-3 py-2 font-mono text-xs text-accent">
               League hint: top score this week takes the{" "}
@@ -1229,13 +1339,18 @@ export default function PicksPage() {
               <p className="mt-5 text-center font-mono text-[11px] uppercase tracking-wider text-muted">
                 Picks are locked for this week
               </p>
+            ) : showLockedNoPicks ? (
+              <p className="mt-5 text-center font-mono text-[11px] uppercase tracking-wider text-muted">
+                Lock-in unavailable until the window opens
+              </p>
             ) : (
               <button
                 type="button"
                 disabled={
                   uniqueDraftPicks.length === 0 ||
                   saveState === "saving" ||
-                  !picksValidForLock
+                  !picksValidForLock ||
+                  !pickWindowOpen
                 }
                 onClick={handleLockIn}
                 className="mt-5 w-full rounded py-3 font-mono text-sm font-bold uppercase tracking-wide transition enabled:bg-accent enabled:text-background enabled:hover:brightness-110 disabled:cursor-not-allowed disabled:border disabled:border-white/10 disabled:bg-white/5 disabled:text-muted"

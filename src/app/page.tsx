@@ -51,14 +51,14 @@ export default function Home() {
               href="/picks"
               className="inline-flex items-center justify-center rounded bg-accent px-6 py-3 font-mono text-sm font-bold uppercase tracking-wide text-background transition hover:brightness-110"
             >
-              Start drafting
+              Make your picks
             </Link>
-            <button
-              type="button"
-              className="rounded border border-white/15 px-6 py-3 font-mono text-sm uppercase tracking-wide text-foreground/90 transition hover:border-accent/50 hover:text-accent"
+            <Link
+              href="/leaderboard"
+              className="inline-flex items-center justify-center rounded border border-white/15 px-6 py-3 font-mono text-sm uppercase tracking-wide text-foreground/90 transition hover:border-accent/50 hover:text-accent"
             >
-              View a demo league
-            </button>
+              See leaderboard
+            </Link>
           </div>
 
           <div className="mt-16 flex flex-wrap gap-3 sm:gap-4">

@@ -5,6 +5,15 @@ import { Suspense, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 
+function SubmitSpinner({ className }: { className?: string }) {
+  return (
+    <span
+      className={`inline-block size-4 shrink-0 rounded-full border-2 border-current border-t-transparent opacity-90 animate-spin ${className ?? ""}`}
+      aria-hidden
+    />
+  );
+}
+
 function LoginForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -136,12 +145,13 @@ function LoginForm() {
           <div className="mt-8 flex rounded-lg border border-[rgba(0,255,100,0.12)] bg-black/30 p-1 font-mono text-[11px] uppercase tracking-wider">
             <button
               type="button"
+              disabled={loading}
               onClick={() => {
                 setMode("login");
                 setError(null);
                 setSignUpSuccess(null);
               }}
-              className={`flex-1 rounded-md py-2 transition ${
+              className={`flex-1 rounded-md py-2 transition disabled:cursor-not-allowed disabled:opacity-40 ${
                 mode === "login"
                   ? "bg-[#00ff64]/20 text-[#00ff64]"
                   : "text-[#6b7f72] hover:text-[#e8f0ec]"
@@ -151,12 +161,13 @@ function LoginForm() {
             </button>
             <button
               type="button"
+              disabled={loading}
               onClick={() => {
                 setMode("signup");
                 setError(null);
                 setSignUpSuccess(null);
               }}
-              className={`flex-1 rounded-md py-2 transition ${
+              className={`flex-1 rounded-md py-2 transition disabled:cursor-not-allowed disabled:opacity-40 ${
                 mode === "signup"
                   ? "bg-[#00ff64]/20 text-[#00ff64]"
                   : "text-[#6b7f72] hover:text-[#e8f0ec]"
@@ -180,9 +191,10 @@ function LoginForm() {
                 type="email"
                 autoComplete="email"
                 required
+                disabled={loading}
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
-                className="mt-1.5 w-full rounded border border-[rgba(0,255,100,0.15)] bg-[#080c0a] px-3 py-2.5 font-mono text-sm text-[#e8f0ec] outline-none ring-[#00ff64]/40 placeholder:text-[#6b7f72] focus:border-[#00ff64]/50 focus:ring-2"
+                className="mt-1.5 w-full rounded border border-[rgba(0,255,100,0.15)] bg-[#080c0a] px-3 py-2.5 font-mono text-sm text-[#e8f0ec] outline-none ring-[#00ff64]/40 placeholder:text-[#6b7f72] focus:border-[#00ff64]/50 focus:ring-2 disabled:cursor-not-allowed disabled:opacity-50"
                 placeholder="you@example.com"
               />
             </div>
@@ -202,23 +214,38 @@ function LoginForm() {
                 }
                 required
                 minLength={6}
+                disabled={loading}
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                className="mt-1.5 w-full rounded border border-[rgba(0,255,100,0.15)] bg-[#080c0a] px-3 py-2.5 font-mono text-sm text-[#e8f0ec] outline-none ring-[#00ff64]/40 placeholder:text-[#6b7f72] focus:border-[#00ff64]/50 focus:ring-2"
+                className="mt-1.5 w-full rounded border border-[rgba(0,255,100,0.15)] bg-[#080c0a] px-3 py-2.5 font-mono text-sm text-[#e8f0ec] outline-none ring-[#00ff64]/40 placeholder:text-[#6b7f72] focus:border-[#00ff64]/50 focus:ring-2 disabled:cursor-not-allowed disabled:opacity-50"
                 placeholder="••••••••"
               />
             </div>
             <button
               type="submit"
               disabled={loading}
-              className="w-full rounded bg-[#00ff64] py-3 font-mono text-sm font-bold uppercase tracking-wide text-[#080c0a] transition hover:brightness-110 disabled:opacity-50"
+              aria-busy={loading}
+              className={`inline-flex w-full items-center justify-center gap-2.5 rounded bg-[#00ff64] py-3 font-mono text-sm font-bold tracking-wide text-[#080c0a] transition hover:enabled:brightness-110 disabled:cursor-not-allowed disabled:opacity-70 ${
+                loading ? "normal-case font-semibold" : "uppercase"
+              }`}
             >
+              {loading && <SubmitSpinner />}
               {loading
-                ? "Please wait…"
+                ? mode === "login"
+                  ? "Signing in..."
+                  : "Creating account..."
                 : mode === "login"
                   ? "Sign in"
                   : "Create account"}
             </button>
+            {loading ? (
+              <p
+                className="text-center font-mono text-[11px] leading-relaxed text-[#6b7f72]"
+                aria-live="polite"
+              >
+                This may take a few seconds...
+              </p>
+            ) : null}
           </form>
 
           <p className="mt-8 text-center font-mono text-[11px] text-[#6b7f72]">
