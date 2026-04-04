@@ -7,14 +7,15 @@ import { getISOWeekKey } from "@/lib/week";
 
 type Direction = "long" | "short";
 
-type Coin = {
+type BoardCoin = {
+  geckoId: string;
   symbol: string;
   name: string;
-  price: number;
-  change7d: number;
+  price: number | null;
+  change7d: number | null;
 };
 
-type Pick = Coin & { direction: Direction; confidence: number };
+type Pick = BoardCoin & { direction: Direction; confidence: number };
 
 type PicksRow = {
   id: string;
@@ -32,12 +33,12 @@ type PicksRow = {
 type ActivePanel =
   | {
       symbol: string;
-      coin: Coin;
+      coin: BoardCoin;
       isNew: true;
       direction: Direction;
       confidence: number;
     }
-  | { symbol: string; coin: Coin; isNew: false };
+  | { symbol: string; coin: BoardCoin; isNew: false };
 
 type CoinGeckoMarket = {
   id: string;
@@ -47,9 +48,6 @@ type CoinGeckoMarket = {
   price_change_percentage_7d_in_currency?: number | null;
   price_change_percentage_7d?: number | null;
 };
-
-const COINGECKO_MARKETS_URL =
-  "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=30&page=1&sparkline=false&price_change_percentage=7d";
 
 const COIN_IDS_ORDER = [
   "bitcoin",
@@ -66,59 +64,145 @@ const COIN_IDS_ORDER = [
   "aave",
   "arbitrum",
   "optimism",
-  "matic-network",
+  "pol",
 ] as const;
+
+type BoardGeckoId = (typeof COIN_IDS_ORDER)[number];
+
+const BOARD_SLOT_COUNT = COIN_IDS_ORDER.length;
+
+/** Split markets requests to reduce rate-limit pressure (8 + 7 = 15). */
+const MARKETS_BATCH_1_IDS = COIN_IDS_ORDER.slice(0, 8);
+const MARKETS_BATCH_2_IDS = COIN_IDS_ORDER.slice(8);
+
+const MARKETS_BATCH_DELAY_MS = 2000;
+
+/** Skip network if cache is newer than this (reduces CoinGecko rate limits). */
+const MARKETS_CACHE_FRESH_MS = 2 * 60 * 1000;
+/** After a failed fetch, use cache only if it is younger than this. */
+const MARKETS_CACHE_STALE_FALLBACK_MS = 5 * 60 * 1000;
+/** Background refetch interval while the picks page is open. */
+const MARKETS_REFETCH_INTERVAL_MS = 2 * 60 * 1000;
+
+const COINGECKO_MARKETS_CACHE_KEY = "draftmarket.coingecko.markets.v1";
+
+type CachedMarketsPayload = {
+  savedAt: number;
+  rows: CoinGeckoMarket[];
+};
+
+function readMarketsCache(): CachedMarketsPayload | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(COINGECKO_MARKETS_CACHE_KEY);
+    if (!raw) return null;
+    const p = JSON.parse(raw) as CachedMarketsPayload;
+    if (typeof p?.savedAt !== "number" || !Array.isArray(p.rows)) return null;
+    return p;
+  } catch {
+    return null;
+  }
+}
+
+function writeMarketsCache(rows: CoinGeckoMarket[]) {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.setItem(
+      COINGECKO_MARKETS_CACHE_KEY,
+      JSON.stringify({ savedAt: Date.now(), rows }),
+    );
+  } catch {
+    /* quota / private mode */
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function coinGeckoMarketsUrlForIds(ids: readonly string[]): string {
+  const idParam = ids.join(",");
+  const n = ids.length;
+  return (
+    `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd` +
+    `&ids=${idParam}&order=market_cap_desc&per_page=${n}&page=1&sparkline=false&price_change_percentage=7d`
+  );
+}
+
+/** Labels only — never substitute for live prices. */
+const COIN_BOARD_META: Record<BoardGeckoId, { symbol: string; name: string }> =
+  {
+    bitcoin: { symbol: "BTC", name: "Bitcoin" },
+    ethereum: { symbol: "ETH", name: "Ethereum" },
+    solana: { symbol: "SOL", name: "Solana" },
+    binancecoin: { symbol: "BNB", name: "BNB" },
+    ripple: { symbol: "XRP", name: "XRP" },
+    "avalanche-2": { symbol: "AVAX", name: "Avalanche" },
+    chainlink: { symbol: "LINK", name: "Chainlink" },
+    polkadot: { symbol: "DOT", name: "Polkadot" },
+    cardano: { symbol: "ADA", name: "Cardano" },
+    dogecoin: { symbol: "DOGE", name: "Dogecoin" },
+    uniswap: { symbol: "UNI", name: "Uniswap" },
+    aave: { symbol: "AAVE", name: "Aave" },
+    arbitrum: { symbol: "ARB", name: "Arbitrum" },
+    optimism: { symbol: "OP", name: "Optimism" },
+    pol: { symbol: "POL", name: "Polygon" },
+  };
 
 const MAX_PICKS = 5;
 const MIN_CONFIDENCE = 5;
 const MAX_CONFIDENCE_PER_PICK = 50;
 const MAX_TOTAL_CONFIDENCE = 100;
 
-const FALLBACK_COINS: Coin[] = [
-  { symbol: "BTC", name: "Bitcoin", price: 98420, change7d: 4.12 },
-  { symbol: "ETH", name: "Ethereum", price: 3452, change7d: -1.85 },
-  { symbol: "SOL", name: "Solana", price: 178.42, change7d: 8.3 },
-  { symbol: "BNB", name: "BNB", price: 612.15, change7d: 2.04 },
-  { symbol: "XRP", name: "XRP", price: 2.18, change7d: -3.2 },
-  { symbol: "AVAX", name: "Avalanche", price: 36.9, change7d: 5.67 },
-  { symbol: "LINK", name: "Chainlink", price: 14.22, change7d: 1.1 },
-  { symbol: "DOT", name: "Polkadot", price: 6.45, change7d: -0.92 },
-  { symbol: "ADA", name: "Cardano", price: 0.78, change7d: 3.45 },
-  { symbol: "DOGE", name: "Dogecoin", price: 0.162, change7d: -4.8 },
-  { symbol: "UNI", name: "Uniswap", price: 9.87, change7d: 6.12 },
-  { symbol: "AAVE", name: "Aave", price: 312.4, change7d: 2.88 },
-  { symbol: "ARB", name: "Arbitrum", price: 0.52, change7d: -2.15 },
-  { symbol: "OP", name: "Optimism", price: 1.35, change7d: 4.5 },
-  { symbol: "MATIC", name: "Polygon", price: 0.38, change7d: 1.22 },
-];
-
-const FALLBACK_BY_ID = new Map(
-  COIN_IDS_ORDER.map((id, i) => [id, FALLBACK_COINS[i]!]),
-);
-
-function marketToCoin(row: CoinGeckoMarket): Coin | null {
-  if (row.current_price == null) return null;
-  const change7d =
-    row.price_change_percentage_7d_in_currency ??
-    row.price_change_percentage_7d ??
-    0;
-  return {
-    symbol: row.symbol.toUpperCase(),
-    name: row.name,
-    price: row.current_price,
-    change7d,
-  };
+function boardSlotsWithoutPrices(): BoardCoin[] {
+  return COIN_IDS_ORDER.map((geckoId) => {
+    const meta = COIN_BOARD_META[geckoId];
+    return {
+      geckoId,
+      symbol: meta.symbol,
+      name: meta.name,
+      price: null,
+      change7d: null,
+    };
+  });
 }
 
-function mapMarketsToCoins(data: CoinGeckoMarket[]): Coin[] {
-  const byId = new Map(data.map((row) => [row.id, row]));
-  return COIN_IDS_ORDER.map((id) => {
-    const row = byId.get(id);
-    if (row) {
-      const mapped = marketToCoin(row);
-      if (mapped) return mapped;
+/**
+ * Map /coins/markets JSON to board rows. Look up each row by CoinGecko `id` only
+ * (never by response array index). Missing or null `current_price` → no price on the card.
+ */
+function buildBoardFromMarkets(data: CoinGeckoMarket[]): BoardCoin[] {
+  const marketsByGeckoId: Record<string, CoinGeckoMarket> = {};
+  for (const row of data) {
+    if (row && typeof row.id === "string" && row.id.length > 0) {
+      marketsByGeckoId[row.id] = row;
     }
-    return FALLBACK_BY_ID.get(id)!;
+  }
+
+  return COIN_IDS_ORDER.map((geckoId) => {
+    const row = marketsByGeckoId[geckoId];
+    const meta = COIN_BOARD_META[geckoId];
+    if (!row || row.current_price == null) {
+      return {
+        geckoId,
+        symbol: meta.symbol,
+        name: meta.name,
+        price: null,
+        change7d: null,
+      };
+    }
+    const ch =
+      row.price_change_percentage_7d_in_currency ??
+      row.price_change_percentage_7d ??
+      null;
+    return {
+      geckoId,
+      symbol: row.symbol.toUpperCase(),
+      name: row.name,
+      price: row.current_price,
+      change7d:
+        typeof ch === "number" && Number.isFinite(ch) ? ch : null,
+    };
   });
 }
 
@@ -235,8 +319,9 @@ export default function PicksPage() {
   const [picksLoading, setPicksLoading] = useState(true);
 
   const [picks, setPicks] = useState<Pick[]>([]);
-  const [coins, setCoins] = useState<Coin[]>(FALLBACK_COINS);
+  const [coins, setCoins] = useState<BoardCoin[]>([]);
   const [coinsLoading, setCoinsLoading] = useState(true);
+  const [coinsError, setCoinsError] = useState<string | null>(null);
 
   const [activePanel, setActivePanel] = useState<ActivePanel | null>(null);
   const activePanelRef = useRef<ActivePanel | null>(null);
@@ -261,6 +346,11 @@ export default function PicksPage() {
   const canAddAnotherPick =
     uniqueDraftPicks.length < MAX_PICKS &&
     MAX_TOTAL_CONFIDENCE - confidenceSum >= MIN_CONFIDENCE;
+
+  const gridCoins = useMemo((): BoardCoin[] => {
+    if (coins.length === BOARD_SLOT_COUNT) return coins;
+    return boardSlotsWithoutPrices();
+  }, [coins]);
 
   useEffect(() => {
     let cancelled = false;
@@ -316,35 +406,96 @@ export default function PicksPage() {
 
   useEffect(() => {
     let cancelled = false;
+    let networkBusy = false;
 
-    async function loadMarkets() {
+    async function loadMarkets(options?: { forceNetwork?: boolean }) {
+      const forceNetwork = options?.forceNetwork ?? false;
+      const now = Date.now();
+      const cache = readMarketsCache();
+
+      if (
+        !forceNetwork &&
+        cache &&
+        now - cache.savedAt < MARKETS_CACHE_FRESH_MS
+      ) {
+        if (!cancelled) {
+          setCoins(buildBoardFromMarkets(cache.rows));
+          setCoinsError(null);
+          setCoinsLoading(false);
+        }
+        return;
+      }
+
+      if (networkBusy) return;
+      networkBusy = true;
       setCoinsLoading(true);
+      setCoinsError(null);
       try {
-        const res = await fetch(COINGECKO_MARKETS_URL);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data: unknown = await res.json();
-        if (!Array.isArray(data)) throw new Error("Invalid payload");
-        const mapped = mapMarketsToCoins(data as CoinGeckoMarket[]);
-        if (!cancelled) setCoins(mapped);
-      } catch {
-        if (!cancelled) setCoins(FALLBACK_COINS);
+        const url1 = coinGeckoMarketsUrlForIds(MARKETS_BATCH_1_IDS);
+        const res1 = await fetch(url1, { cache: "no-store" });
+        if (!res1.ok) throw new Error(`HTTP ${res1.status} (batch 1)`);
+        const raw1: unknown = await res1.json();
+        if (!Array.isArray(raw1)) throw new Error("Invalid payload (batch 1)");
+        const batch1 = raw1 as CoinGeckoMarket[];
+
+        if (cancelled) return;
+        await delay(MARKETS_BATCH_DELAY_MS);
+        if (cancelled) return;
+
+        const url2 = coinGeckoMarketsUrlForIds(MARKETS_BATCH_2_IDS);
+        const res2 = await fetch(url2, { cache: "no-store" });
+        if (!res2.ok) throw new Error(`HTTP ${res2.status} (batch 2)`);
+        const raw2: unknown = await res2.json();
+        if (!Array.isArray(raw2)) throw new Error("Invalid payload (batch 2)");
+        const batch2 = raw2 as CoinGeckoMarket[];
+
+        const merged = [...batch1, ...batch2];
+        writeMarketsCache(merged);
+        if (!cancelled) {
+          setCoins(buildBoardFromMarkets(merged));
+          setCoinsError(null);
+        }
+      } catch (e) {
+        if (cancelled) return;
+        console.error("[picks] CoinGecko markets load failed", e);
+        const fallback = readMarketsCache();
+        const fallbackOk =
+          fallback &&
+          Date.now() - fallback.savedAt < MARKETS_CACHE_STALE_FALLBACK_MS;
+        if (fallbackOk) {
+          setCoins(buildBoardFromMarkets(fallback.rows));
+          setCoinsError(null);
+        } else {
+          setCoins(boardSlotsWithoutPrices());
+          setCoinsError(
+            "Could not load live prices from CoinGecko. Refresh the page or try again shortly.",
+          );
+        }
       } finally {
+        networkBusy = false;
         if (!cancelled) setCoinsLoading(false);
       }
     }
 
-    loadMarkets();
+    loadMarkets({ forceNetwork: false });
+
+    const intervalId = window.setInterval(() => {
+      loadMarkets({ forceNetwork: true });
+    }, MARKETS_REFETCH_INTERVAL_MS);
+
     return () => {
       cancelled = true;
+      window.clearInterval(intervalId);
     };
   }, []);
 
   const lockedConfidence = lockedRows.reduce((s, r) => s + r.confidence, 0);
 
   const openPanel = useCallback(
-    (coin: Coin, direction: Direction) => {
+    (coin: BoardCoin, direction: Direction) => {
+      if (coin.price == null) return;
       const sym = normalizeSymbol(coin.symbol);
-      const normalizedCoin: Coin = { ...coin, symbol: sym };
+      const normalizedCoin: BoardCoin = { ...coin, symbol: sym };
       const existing = uniqueDraftPicks.find(
         (p) => normalizeSymbol(p.symbol) === sym,
       );
@@ -430,7 +581,7 @@ export default function PicksPage() {
 
   const commitNewPick = useCallback(() => {
     const ap = activePanelRef.current;
-    if (!ap || !ap.isNew) return;
+    if (!ap || !ap.isNew || ap.coin.price == null) return;
     setPicks((prev) => {
       const list = dedupePicksBySymbol(prev);
       const cap = maxConfidenceForNewPick(list);
@@ -455,6 +606,7 @@ export default function PicksPage() {
     uniqueDraftPicks.every((p) => {
       const cap = maxConfidenceForPick(uniqueDraftPicks, p.symbol);
       return (
+        p.price != null &&
         p.confidence >= MIN_CONFIDENCE &&
         p.confidence <= cap &&
         p.confidence <= MAX_CONFIDENCE_PER_PICK
@@ -483,17 +635,44 @@ export default function PicksPage() {
       return;
     }
 
+    const priceBySymbol = new Map<string, number>();
+    for (const c of coins) {
+      const sym = normalizeSymbol(c.symbol);
+      if (c.price != null && Number.isFinite(c.price) && c.price > 0) {
+        priceBySymbol.set(sym, c.price);
+      }
+    }
+    for (const p of uniquePicks) {
+      const sym = normalizeSymbol(p.symbol);
+      const live = priceBySymbol.get(sym);
+      if (
+        live == null ||
+        !Number.isFinite(live) ||
+        live <= 0
+      ) {
+        setSaveState("error");
+        setSaveError(
+          `No live board price for ${sym}. Wait for prices to load or refresh, then try again.`,
+        );
+        return;
+      }
+    }
+
     const { weekNumber, year } = weekKey;
-    const rows = uniquePicks.map((p) => ({
-      user_id: u.id,
-      week_number: weekNumber,
-      year,
-      coin_symbol: p.symbol,
-      coin_name: p.name,
-      direction: p.direction,
-      confidence: p.confidence,
-      entry_price: p.price,
-    }));
+    const rows = uniquePicks.map((p) => {
+      const sym = normalizeSymbol(p.symbol);
+      const entry_price = priceBySymbol.get(sym)!;
+      return {
+        user_id: u.id,
+        week_number: weekNumber,
+        year,
+        coin_symbol: sym,
+        coin_name: p.name,
+        direction: p.direction,
+        confidence: p.confidence,
+        entry_price,
+      };
+    });
 
     const { data, error } = await supabase
       .from("picks")
@@ -513,9 +692,9 @@ export default function PicksPage() {
     setPicks([]);
     setActivePanel(null);
     setSaveState("success");
-  }, [picks, weekKey]);
+  }, [picks, weekKey, coins]);
 
-  const isExpanded = (coin: Coin) =>
+  const isExpanded = (coin: BoardCoin) =>
     activePanel &&
     normalizeSymbol(activePanel.symbol) === normalizeSymbol(coin.symbol);
 
@@ -557,6 +736,14 @@ export default function PicksPage() {
             ) : !hasLockedThisWeek ? (
               <p className="mt-3 font-mono text-[11px] text-muted">
                 Prices via CoinGecko · USD · 7d change
+              </p>
+            ) : null}
+            {coinsError && !hasLockedThisWeek ? (
+              <p
+                className="mt-3 rounded border border-accent-red/40 bg-accent-red/10 px-3 py-2 font-mono text-xs text-accent-red"
+                role="alert"
+              >
+                {coinsError}
               </p>
             ) : null}
           </div>
@@ -625,7 +812,7 @@ export default function PicksPage() {
                       </div>
                     </div>
                   ))
-                : coins.map((coin) => {
+                : gridCoins.map((coin) => {
                     const selected = uniqueDraftPicks.find(
                       (p) =>
                         normalizeSymbol(p.symbol) ===
@@ -633,7 +820,9 @@ export default function PicksPage() {
                     );
                     const expanded = isExpanded(coin);
                     const canOpenNew = !selected && canAddAnotherPick;
-                    const up = coin.change7d >= 0;
+                    const hasLivePrice = coin.price != null;
+                    const up =
+                      coin.change7d != null && coin.change7d >= 0;
 
                     const panel = activePanel;
                     const showPanel =
@@ -658,7 +847,7 @@ export default function PicksPage() {
 
                     return (
                       <article
-                        key={coin.symbol}
+                        key={coin.geckoId}
                         className={`rounded-lg border border-[color:var(--border)] bg-white/[0.02] p-4 transition-[padding,box-shadow] duration-200 ${
                           expanded
                             ? "ring-1 ring-accent/40 shadow-lg shadow-black/20 sm:col-span-2 xl:col-span-2"
@@ -700,25 +889,51 @@ export default function PicksPage() {
                           </div>
 
                           <div className="mt-4 space-y-1">
-                            <p className="font-mono text-xl font-bold tracking-tight">
-                              {formatPrice(coin.price)}
-                            </p>
-                            <p
-                              className={`font-mono text-sm font-medium ${
-                                up ? "text-accent" : "text-accent-red"
-                              }`}
-                            >
-                              {up ? "+" : ""}
-                              {coin.change7d.toFixed(2)}%{" "}
-                              <span className="text-muted">7d</span>
-                            </p>
+                            {coin.price != null ? (
+                              <p className="font-mono text-xl font-bold tracking-tight">
+                                {formatPrice(coin.price)}
+                              </p>
+                            ) : (
+                              <div
+                                className="h-7 w-32 max-w-full animate-pulse rounded bg-white/10"
+                                aria-hidden
+                              />
+                            )}
+                            {coin.change7d != null ? (
+                              <p
+                                className={`font-mono text-sm font-medium ${
+                                  up ? "text-accent" : "text-accent-red"
+                                }`}
+                              >
+                                {up ? "+" : ""}
+                                {coin.change7d.toFixed(2)}%{" "}
+                                <span className="text-muted">7d</span>
+                              </p>
+                            ) : hasLivePrice ? (
+                              <p className="font-mono text-sm text-muted">
+                                7d change unavailable
+                              </p>
+                            ) : (
+                              <div
+                                className="h-4 w-24 animate-pulse rounded bg-white/5"
+                                aria-hidden
+                              />
+                            )}
                           </div>
                         </button>
 
                         <div className="mt-4 flex gap-2">
                           <button
                             type="button"
-                            disabled={!selected && !canOpenNew}
+                            disabled={
+                              !hasLivePrice ||
+                              (!selected && !canOpenNew)
+                            }
+                            title={
+                              !hasLivePrice
+                                ? "Waiting for live price from CoinGecko"
+                                : undefined
+                            }
                             onClick={() => openPanel(coin, "long")}
                             className="flex-1 rounded border border-accent/50 bg-accent/10 py-2 font-mono text-xs font-bold uppercase tracking-wide text-accent transition hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-35"
                           >
@@ -726,7 +941,15 @@ export default function PicksPage() {
                           </button>
                           <button
                             type="button"
-                            disabled={!selected && !canOpenNew}
+                            disabled={
+                              !hasLivePrice ||
+                              (!selected && !canOpenNew)
+                            }
+                            title={
+                              !hasLivePrice
+                                ? "Waiting for live price from CoinGecko"
+                                : undefined
+                            }
                             onClick={() => openPanel(coin, "short")}
                             className="flex-1 rounded border border-accent-red/50 bg-accent-red/10 py-2 font-mono text-xs font-bold uppercase tracking-wide text-accent-red transition hover:bg-accent-red/20 disabled:cursor-not-allowed disabled:opacity-35"
                           >
@@ -742,8 +965,9 @@ export default function PicksPage() {
                             <div className="flex gap-2">
                               <button
                                 type="button"
+                                disabled={coin.price == null}
                                 onClick={() => setPanelDirection("long")}
-                                className={`flex-1 rounded border py-2 font-mono text-xs font-bold uppercase tracking-wide transition ${
+                                className={`flex-1 rounded border py-2 font-mono text-xs font-bold uppercase tracking-wide transition disabled:cursor-not-allowed disabled:opacity-35 ${
                                   panelDirection === "long"
                                     ? "border-accent bg-accent/20 text-accent"
                                     : "border-white/10 text-muted hover:border-accent/40"
@@ -753,8 +977,9 @@ export default function PicksPage() {
                               </button>
                               <button
                                 type="button"
+                                disabled={coin.price == null}
                                 onClick={() => setPanelDirection("short")}
-                                className={`flex-1 rounded border py-2 font-mono text-xs font-bold uppercase tracking-wide transition ${
+                                className={`flex-1 rounded border py-2 font-mono text-xs font-bold uppercase tracking-wide transition disabled:cursor-not-allowed disabled:opacity-35 ${
                                   panelDirection === "short"
                                     ? "border-accent-red bg-accent-red/20 text-accent-red"
                                     : "border-white/10 text-muted hover:border-accent-red/40"
