@@ -124,9 +124,9 @@ function LoginForm() {
           </p>
 
           {searchParams.get("error") === "auth" && (
-            <p className="mt-4 rounded border border-[#ff4d6d]/40 bg-[#ff4d6d]/10 px-3 py-2 font-mono text-xs text-[#ff4d6d]">
-              Something went wrong confirming your session. Try signing in
-              again.
+            <p className="mt-4 rounded border border-[#ff4d6d]/40 bg-[#ff4d6d]/10 px-3 py-2 font-mono text-xs leading-relaxed text-[#ff4d6d]">
+              {searchParams.get("message")?.trim() ||
+                "Something went wrong confirming your session. Try signing in again."}
             </p>
           )}
 
