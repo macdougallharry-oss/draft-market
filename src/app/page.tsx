@@ -64,6 +64,16 @@ export default async function Home() {
             DraftMarket turns volatility into competition — draft assets, set
             directional calls, and outscore rivals in private or public leagues.
           </p>
+          <p className="mt-3 max-w-xl font-mono text-xs text-muted">
+            To receive a prize, email{" "}
+            <a
+              href="mailto:harrymacdougall@gmail.com"
+              className="text-accent hover:underline"
+            >
+              harrymacdougall@gmail.com
+            </a>
+            .
+          </p>
           <div className="mt-10 flex flex-wrap gap-4">
             <Link
               href="/picks"
