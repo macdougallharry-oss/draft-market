@@ -40,7 +40,7 @@ export default async function Home() {
 
   const stats = [
     { label: "Players", value: playerCount.toLocaleString("en-US") },
-    { label: "Weekly prize", value: "£50" },
+    { label: "Weekly prize", value: "£10" },
     { label: "Coins", value: "14+" },
     { label: "Free", value: "Always" },
   ] as const;

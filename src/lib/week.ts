@@ -107,3 +107,8 @@ export function formatDurationParts(ms: number): {
     seconds: x % 60,
   };
 }
+
+/** UI label for the weekly cash pool. */
+export function weeklyPrizeGbpLabel(): string {
+  return "£10";
+}

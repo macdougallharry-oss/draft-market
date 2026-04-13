@@ -8,7 +8,7 @@ import {
   totalLiveScore,
   type ScorePick,
 } from "@/lib/scoring";
-import { getISOWeekKey } from "@/lib/week";
+import { getISOWeekKey, weeklyPrizeGbpLabel } from "@/lib/week";
 
 type DbPickRow = {
   user_id: string;
@@ -115,6 +115,7 @@ function picksLoadErrorMessage(err: unknown): string {
 
 export default function LeaderboardPage() {
   const weekKey = useMemo(() => getISOWeekKey(), []);
+  const prizeLabel = weeklyPrizeGbpLabel();
 
   const [rows, setRows] = useState<LeaderRow[]>([]);
   const [loading, setLoading] = useState(true);
@@ -282,7 +283,7 @@ export default function LeaderboardPage() {
             Week {weekKey.weekNumber} prize
           </p>
           <p className="mt-1 font-sans text-2xl font-semibold tracking-tight sm:text-3xl">
-            <span className="font-mono text-accent">£50</span>{" "}
+            <span className="font-mono text-accent">{prizeLabel}</span>{" "}
             <span className="text-foreground/90">
               Week {weekKey.weekNumber} · {weekKey.year} pool
             </span>
@@ -419,7 +420,7 @@ export default function LeaderboardPage() {
                             topRank ? "text-accent" : "text-muted"
                           }`}
                         >
-                          {topRank ? "£50" : "—"}
+                          {topRank ? prizeLabel : "—"}
                         </td>
                       </tr>
                     );

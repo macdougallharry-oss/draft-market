@@ -10,6 +10,7 @@ import {
   getNextPickWindowOpenUTC,
   getPickDeadline,
   isPickWindowOpen,
+  weeklyPrizeGbpLabel,
 } from "@/lib/week";
 
 type Direction = "long" | "short";
@@ -371,6 +372,7 @@ export default function PicksPage() {
     () => getISOWeekKey(new Date(weekStableKey)),
     [weekStableKey],
   );
+  const prizeLabel = weeklyPrizeGbpLabel();
 
   const reopenInMs = useMemo(
     () => getNextPickWindowOpenUTC(nowDate).getTime() - nowTick,
@@ -1332,7 +1334,7 @@ export default function PicksPage() {
 
             <p className="mt-5 rounded border border-accent/20 bg-accent/5 px-3 py-2 font-mono text-xs text-accent">
               League hint: top score this week takes the{" "}
-              <span className="font-bold">£50</span> prize.
+              <span className="font-bold">{prizeLabel}</span> prize.
             </p>
 
             {hasLockedThisWeek ? (
